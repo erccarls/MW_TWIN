@@ -1,0 +1,246 @@
+#===============================================================================
+# Author: Eric Carlson 
+# E-mail: erccarls@ucsc.edu
+# Description: Integrates galprop emissivity maps for arbitary inclination through LOS.
+# Output:Outputs FITS with units erg s^-1 sr^-1 as a function of energy
+# Last Modified: April 6 2012
+#===============================================================================
+from scipy import *
+import sys
+sys.path.append('./pyfits/lib')
+
+
+#===============================================================================
+# Parameters: Emissivity filename, FITS ouput filename, physical radius of
+# emissivity file, and total physical height (z) of emissivity file (i.e. +-5kpc
+# would be take arg 10),inclination in degrees,  physical distance to the object
+# in kpc, frequency, and the instrument half power beam width (hpbw) in arcsec
+# and the faintest contour n, and the width in arc-minutes of the output plot.
+#===============================================================================
+def calc_emiss(emissFilename, fileout, r_kpc, z_kpc, inclination, objectDist, frequency, hpbw,contour_n,width):
+    import pyfits, numpy, math #@UnresolvedImport
+    import os, sys
+    from sys import stdout
+    
+    pc2cm = 3.08568025e18
+    erg2MeV = 624150.974
+    
+    # Determine which energy bin to use based on the frequency passed in.
+    vSyncLow     = 1.02026e8        #These are found in the GALDEF File
+    vSyncFactor  = 1.125            #These are found in the GALDEF File
+    eBin = int(round(math.log(frequency/vSyncLow)/math.log(vSyncFactor))) 
+    print 'Selected Frequency:' + str(frequency/1e9) + 'GHz \nEnergy bin: ' + str(eBin)
+
+    # generate a square image.
+    outRes = 200         # Number of pixels for square output image 
+    num_zSteps = 100     # Number of z-steps along the integration line
+
+
+    # load emissivity data
+    hdulist = pyfits.open(emissFilename, mode='update')
+    scidata = hdulist[0].data
+    hdulist.info()
+    
+    # Read FITS header to get dimensions of emissivity map (pixels)
+    dimen = scidata.shape
+    iRange = int(dimen[0])
+    jRange = int(dimen[1])
+    kRange = int(dimen[2])
+    lRange = int(dimen[3])
+    print "Ranges are", iRange, jRange, kRange, lRange
+
+    if (eBin>=jRange): 
+        print "Energy out of range.  Exiting..."
+        return
+    #===========================================================================
+    # We now will choose a coordinate system of (x',y',z') with the +z' face of a
+    # cube parallel to the observer (output image) so that we integrate along z'
+    # axis. Thus we have a cylindrical input map rotated in a cube. This cube is
+    # chosen to have side length of 1.5*the diameter of the cylinder.  Points in
+    # the primed system are mapped to points in the unprimed system via an inverse
+    # euler rotation.  Rotations are unitary so the transpose of the standard
+    # rotation matrix yields the inverse.
+    #===========================================================================
+    
+    # Calculate the physical side length of the output map based on object distance and angular size of output. 
+    sideLength = objectDist*math.tan(width/60/180*math.pi)
+    print 'Output sidelength (kpc): ' , sideLength
+    
+    #sideLength       = 1.5*r_kpc                            # Physical cube side length in kpc
+    kpcPerPixelOut = float(sideLength)/outRes                # Output has square aspect ratio
+    kpcPerDeltaZ   = float(sideLength)/num_zSteps            # Physical distance for z integration interval
+    kpcPerPixelInZ = float(z_kpc)/kRange                     # Input Z has 10:1 aspect ratio z:r
+    kpcPerPixelInR = float(r_kpc)/lRange                     # 
+    cmPerPixelOut  = kpcPerPixelOut*pc2cm*1000               # Output cm/pixel
+    solidAngle       = 1/((objectDist*1000*pc2cm)**2)        # 4 pi * ratio of 1 cm^2 to the entire sphere given distance    
+    volPerPixelOut = cmPerPixelOut**2.0*kpcPerDeltaZ*1000*pc2cm
+    sqArcSecPerSr  = 42545949625.0                                          # Square arcseconds per sr
+    pixelPerArcSecSq  = objectDist**2/(sqArcSecPerSr*(kpcPerPixelOut**2))   # pixel/ArcSec^2 
+    beamConversion    = pixelPerArcSecSq * (math.pi * (hpbw/2)**2)          # pixel/ArcSec^2  * arcSec^2/beam        
+    
+    print 'ArcSec^2/pixel: ' + str(1/pixelPerArcSecSq)
+    print 'Beam Conversion: ' + str(beamConversion)
+    
+    image = numpy.zeros((outRes, outRes))
+    print 'Beginning Integration'
+
+    for i in range(0,outRes):                  # x loop
+        for j in range(0,outRes):              # y loop
+            flux = 0.0                         # total flux sum
+            for k in range (0,num_zSteps):     # z-integration
+                # Shift coordinates so they are centered on galaxy and convert to kpc before transforming to emiss. coordinates.
+                outPosition = ((i-outRes/2.0)*kpcPerPixelOut,(j-outRes/2.0)*kpcPerPixelOut,(k-num_zSteps/2.0)*kpcPerDeltaZ)
+                inPosition  = rotate_coordinates(outPosition,inclination[0]/180.0*math.pi,0,inclination[1]/180.0*math.pi)       # Rotate to input emissivity file coords.
+                r = math.sqrt(inPosition[0]**2+inPosition[1]**2)                              # Calc r in kpc
+                z = inPosition[2]                                                             # Calc z in kpc
+                if (abs(z) < z_kpc/2.0 and r < float(r_kpc)):                                 # Check that we are within the bounds of the input image.
+                    xPixel = round(r/kpcPerPixelInR)                                          # Calc the actual pixel coordinates.
+                    yPixel = round((z+z_kpc/2.0)/kpcPerPixelInZ)                              # Calc the actual pixel coordinates.
+                    # Ensure we are have a valid coordinate.  The edge flux may be underestimated since we are truncating.  
+                    if (xPixel < lRange and yPixel < kRange):    
+                        density = scidata[0,eBin,yPixel, xPixel]                              # Read density from file
+                        flux += volPerPixelOut*density                                        # Volume*energy density            
+            if(flux!=0):
+                #image[j,i] = log(flux*frequency*solidAngle)
+                image[j,i] = flux*frequency*solidAngle
+        
+        # Monitor Progress in terminal.
+        sys.stdout.write('\r' + str(int(float(i)/outRes*100)))
+        sys.stdout.flush()
+    
+    print '\n'
+    print 'Total Flux (erg/s/cm^2):' + str(numpy.sum(image))
+    print 'Total Flux (Jy):' + str(numpy.sum(image)*1.0e23/frequency)
+    print 'Complete.  FITS image output to ' + fileout
+
+    #===========================================================================
+    # Write array to FITS image
+    #===========================================================================    
+    hdu     = pyfits.PrimaryHDU(beamConversion*image*1.0e23*1000/frequency)
+    hdulist = pyfits.HDUList([hdu])
+    if os.access(fileout, os.F_OK ):  os.remove(fileout)
+    hdulist.writeto(fileout)    
+    
+
+    #===========================================================================
+    # Contour plot with scipy
+    #===========================================================================
+    import matplotlib.pyplot as plt  #@UnresolvedImport
+    import matplotlib.image as mpimg #@UnresolvedImport
+    import matplotlib.cm as cm
+    from matplotlib.patches import Ellipse
+    import matplotlib.patches as mpatches
+    import matplotlib
+    from matplotlib.collections import PatchCollection
+    
+    SideLengthArcMin = math.atan(sideLength/objectDist)*180/math.pi*60 #side length in arc minutes
+    #SideLengthArcMin = sideLength
+    
+    
+    #ax = plt.axes([0,0,1,1])
+    #patches = [mpatches.Ellipse([0,0], 13.5, 2.5, fc='r')]
+    #collection = PatchCollection(patches, alpha=.2)
+    #ax.add_collection(collection)
+    
+    plt.hold(True)
+    
+    img = plt.imshow(beamConversion*image*1.0e23/frequency*1000,origin='lower', extent=[-SideLengthArcMin/2,SideLengthArcMin/2,-SideLengthArcMin/2,SideLengthArcMin/2])
+    plt.colorbar( img, shrink=.8 ,extend='both')
+    
+    plt.xlabel('x (arcmin)')
+    plt.ylabel('y (arcmin)')
+    plt.title('Flux ($mJy Beam^{-1}$ at ' + str(frequency/1.0e9) + 'GHz)\nTotal Flux:' + str(round(numpy.sum(image)*1.0e23/frequency,6)) + ' Jy')
+    levelList =  []
+    for i in range(0,10):
+        levelList.append(2.0**((contour_n+i)/2))
+    
+    CS = plt.contour(beamConversion*image*1.0e23/frequency*1000,origin='lower', extent=[-SideLengthArcMin/2,SideLengthArcMin/2,-SideLengthArcMin/2,SideLengthArcMin/2],levels=levelList, colors = 'w')
+    
+    plt.clabel(CS, fontsize=8, inline=1)
+    #plt.colorbar( shrink=.8 ,extend='both')
+    #plt.flag()
+
+    plt.savefig(str(fileout)+ '.png')
+    
+    plt.show()
+
+
+
+
+#===============================================================================
+# Maps coordinates in the output image to those of the input map via inverse
+# euler rotation matrix.  See wikipedia article on "Rotation Matrix".  Input is
+# the rotated coordinate vector (x',y',z') followed by the first euler angle
+# for the galaxy which is the inclination. Returns (x,y,z) for the emissivity map (x^2+y^2=r).
+#===============================================================================
+#def rotate_coordinates(vector,phi):
+#    import math
+#    x = vector[0]
+#    y = vector[1]*math.cos(phi) + vector[2]*math.sin(phi)
+#    z = -vector[1]*math.sin(phi)+ vector[2]*math.cos(phi)
+#    return (x,y,z)
+
+
+# Same as above, but for full set of euler angles.  Redundant for axially symmetric galaxy
+#===============================================================================
+# Maps coordinates in the output image to those of the input map via inverse
+# euler rotation matrix.  See wikipedia article on "Rotation Matrix".  Input is
+# the rotated coordinate vector (x',y',z') followed by the euler rotation angles
+# for the galaxy. Returns (x,y,z) for the emissivity map (x^2+y^2=r).
+#===============================================================================
+def rotate_coordinates(vector,phi,theta,psi):
+    import math
+    x = vector[0]*math.cos(theta)*math.cos(psi) + vector[1]*math.cos(theta)*math.sin(psi) - vector[2]*math.sin(theta)
+    y = vector[0]*(-math.cos(phi)*math.sin(psi)+math.sin(phi)*math.sin(theta)*math.cos(psi)) + vector[1]*(math.cos(phi)*math.cos(psi)+math.sin(phi)*math.sin(theta)*math.sin(psi)) + vector[2]*math.sin(phi)*math.cos(theta)
+    z = vector[0]*(math.sin(phi)*math.sin(psi)+math.cos(phi)*math.sin(theta)*math.cos(psi))+vector[1]*(-math.sin(phi)*math.cos(psi)+math.cos(phi)*math.sin(theta)*math.sin(psi))+vector[2]*math.cos(phi)*math.cos(theta)
+    return (x,y,z)
+    
+
+
+
+# NGC 891 DM_Only
+#calc_emiss('./diff.fits', 'out.fits',20.0,16.0,[88.3,-67.0],10200.0, 1.485E9, 48,-2.0,12.0)
+# NGC 891 All
+##calc_emiss('./synchrotron_emiss_54_extragalactic_wmap_good_highZ', 'out_all.fits',20.0,16.0,[88.3,-67.0],10200.0, 1.485E9, 48,-2.0,12.0)
+#Inclination NGC891 is 88.3
+
+#  PARAMETERS:  emissFilename, fileout, r_kpc, z_kpc, inclination, objectDist, frequency, hpbw,contour_n,width
+calc_emiss('./sync.emiss.extragalactic_DM_Only.fits', 'm31_out_DM_ONLY.fits',20.0,16.0,[77.5,-55],700.0, 1.485E9, 48,-2.0,20.0)
+
+
+
+
+#===============================================================================
+# #######################################################################
+#    totalemission = 0
+#    totalarea = 0
+#    num_steradians = 0
+#    total_num_steradians = 0
+#    for l in range(0, lrange): ##r
+#        newrdist = rstart + rstep * l
+#        if(l > 0):
+#            oldrdist = rstart + rstep * (l-1)
+#        else:
+#            oldrdist = 0
+#        radius_size = math.pi*(math.pow(newrdist, 2.0)-math.pow(oldrdist, 2.0)) ##size of zone in (cm^2)
+#        totalarea += radius_size
+#        num_steradians = radius_size / math.pow(observer_position, 2.0) ## if the radius_size is the same as the solid angle of the observing sphere, it would be 4*PI
+#        total_num_steradians += num_steradians
+#        for k in range(0, krange): #z
+#            totalhertz = 0
+#            totaldepth = 0
+#            for j in range(0, jrange): #energy
+#                newhertz = estart * math.pow(estep, j)
+#                if(j == 0):
+#                    oldhertz = 0
+#                else:
+#                    oldhertz = estart * math.pow(estep, j-1)
+#                hertzrange = newhertz - oldhertz
+#                totalhertz += hertzrange
+#                totaldepth += zstep 
+#                emission = hertzrange * zstep * num_steradians * scidata[0,j,k,l] * erg2MeV
+#                totalemission += emission
+#    print totalemission, totalarea, total_num_steradians, totalhertz, totaldepth
+# 
+# calc_IC_emiss('./', sys.argv[1])
+#===============================================================================
